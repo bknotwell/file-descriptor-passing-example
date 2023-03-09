@@ -1,0 +1,297 @@
+* File descriptor passing example
+The code below shows how to pass a socket between processes.  Combined
+with setting the /setuid/ bit on the /getsock/ executable, it could be
+used to open a socket requiring superuser privileges.
+
+** Creation
+
+This executable has one purpose--creating a datagram ICMP socket and
+passing it to another process over a Unix domain socket.  *NB:* the
+=socket= call that combines =SOCK_DGRAM= and =IPPROTO_ICMP= is
+Linux-specific.
+
+#+begin_src C :tangle getsock.c
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <netinet/in.h>
+#include <unistd.h>
+
+int main(int argc, char* argv[]) {
+  int mysock, domainsock, len;
+  char* errString = "socketname required";
+  char* sockname_prefix;
+  struct sockaddr_un server_sockaddr = {0};
+  struct sockaddr_un client_sockaddr = {0};
+
+  if(argc != 2)
+  error:
+    return(fprintf(stderr, "%s: %s\n", argv[0], errString), EXIT_FAILURE);
+
+  sockname_prefix = argv[1]; // don't overflow the socket buffer
+  if((strlen(sockname_prefix) + 3) > sizeof(client_sockaddr.sun_path)) {
+    errString = "sockname prefix too long";
+    goto error;
+  }
+
+  if((mysock = socket(PF_INET, SOCK_DGRAM, IPPROTO_ICMP)) == -1) {
+    errString = "datagram socket creation failed";
+    goto error;
+  }
+
+  if((domainsock = socket(AF_UNIX, SOCK_DGRAM, 0)) == -1) {
+    errString = "domain socket creation failed";
+    (void)close(rawsock);
+    goto error;
+  }
+
+  client_sockaddr.sun_family = AF_UNIX;
+  server_sockaddr.sun_family = AF_UNIX;
+  strcpy(client_sockaddr.sun_path, sockname_prefix);
+  strcpy(server_sockaddr.sun_path, sockname_prefix);
+  strcpy(client_sockaddr.sun_path + strlen(sockname_prefix), "-c");
+  strcpy(server_sockaddr.sun_path + strlen(sockname_prefix), "-s");
+  len = sizeof(client_sockaddr);
+
+  (void)unlink(client_sockaddr.sun_path);
+  if(bind(domainsock, (struct sockaddr*)&client_sockaddr, len) == -1) {
+    errString = "binding to client socket failed";
+    goto error;
+  }
+
+  if(connect(domainsock, (struct sockaddr*)&server_sockaddr, len) == -1) {
+    errString = "connecting to server socket failed";
+    (void)unlink(client_sockaddr.sun_path);
+    (void)close(domainsock);
+    goto error;
+  }
+
+  // send mysock to the server process
+  {
+#define CMSG_SIZE CMSG_SPACE(sizeof(int))    
+    struct iovec iov = {0};
+    struct msghdr msgh = {0};
+    char buf[CMSG_SIZE];
+    struct cmsghdr *h;
+
+    msgh.msg_name = NULL;
+    msgh.msg_namelen = 0;
+    msgh.msg_iov = &iov;
+    msgh.msg_iovlen = 1;
+    msgh.msg_control = buf;
+    msgh.msg_controllen = CMSG_SIZE;
+    msgh.msg_flags = 0;
+
+    iov.iov_base = (void*)&msgh;
+    iov.iov_len = len;
+
+    h = CMSG_FIRSTHDR(&msgh);
+    h->cmsg_len = CMSG_LEN(sizeof(int));
+    h->cmsg_level = SOL_SOCKET;
+    h->cmsg_type = SCM_RIGHTS;
+    ,*((int*)CMSG_DATA(h)) = rawsock;
+
+    if(sendmsg(domainsock, &msgh, 0) == -1) {
+      errString = "failed sendmsg";
+      goto error;
+    }
+  }
+  (void)close(domainsock);
+  (void)close(mysock);
+  return(EXIT_SUCCESS);
+}
+#+end_src
+
+** Receiver
+The code below forks and execs the /getsock/ process, creates a
+listening domain socket, does a recvmsg on the socket and extracts the
+filedescriptor.
+
+#+NAME: receiveSocket
+#+begin_src C :tangle sockwrap.c
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <sys/un.h>
+#include <sys/select.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <netinet/ip_icmp.h>
+
+static int getsock(const char* socknameprefix, char** errString) {
+  struct sockaddr_un server_sockaddr = {0};
+  int domainsock, len;
+  pid_t pid;
+  int fd = -1;
+  
+  if((strlen(socknameprefix) + 3) > sizeof(server_sockaddr.sun_path)) {
+    ,*errString = "sockname prefix too long";
+    return -1;
+  }
+  
+  server_sockaddr.sun_family = AF_UNIX;
+  strcpy(server_sockaddr.sun_path, socknameprefix);
+  strcpy(server_sockaddr.sun_path + strlen(socknameprefix), "-s");
+  len = sizeof(server_sockaddr);
+
+  if((domainsock = socket(AF_UNIX, SOCK_DGRAM, 0)) == -1) {
+    ,*errString = "domain socket creation failed";
+    return -1;
+  }
+
+  (void)unlink(server_sockaddr.sun_path);
+  if(bind(domainsock, (struct sockaddr*)&server_sockaddr, len) == -1) {
+    ,*errString = "binding to server socket failed";
+    close(domainsock);
+    return -1;
+  }
+
+  switch(pid = fork()) {
+  case 0:
+    execl("./getsock", "getsock", socknameprefix, 0);
+    break;
+  case -1:
+   ,*errString = "fork failed";
+    break;
+  default:
+    {
+#define CMSG_SIZE CMSG_SPACE(sizeof(int))    
+      struct iovec iov = {0};
+      struct msghdr msgh = {0};
+      char buf[CMSG_SIZE], msgbuf[4096];
+      struct cmsghdr *h;
+      fd_set readfds = {0};
+      struct timeval timeout = {0, 250000};  // maximum 1/4 second to sync
+
+      iov.iov_base = msgbuf;
+      iov.iov_len = sizeof(msgbuf);
+
+      msgh.msg_name = NULL;
+      msgh.msg_namelen = 0;
+
+      msgh.msg_iov = &iov;
+      msgh.msg_iovlen = 1;
+
+      msgh.msg_control = buf;
+      msgh.msg_controllen = CMSG_SIZE;
+      msgh.msg_flags = 0;
+
+      FD_SET(domainsock, &readfds);
+
+      if(select(domainsock + 1,  &readfds, 0, 0, &timeout) <= 0)
+        ,*errString = "select failed or timedout";
+      else if(recvmsg(domainsock, &msgh, 0) == -1)
+        ,*errString = "recvmsg failed";
+      else if((h = CMSG_FIRSTHDR(&msgh)) != NULL &&
+           h->cmsg_len == CMSG_LEN(sizeof(int)) &&
+           h->cmsg_level == SOL_SOCKET &&
+           h->cmsg_type == SCM_RIGHTS)
+          fd = *((int*)CMSG_DATA(h));
+      else
+        ,*errString = "message format incorrect";
+
+      waitpid(pid, 0, WNOHANG);
+    }
+    break;
+
+  }
+
+  close(domainsock);
+  return fd;
+}
+#ifdef MAIN
+int main(int argc, char* argv[]) {
+  char* errString ="socketname";
+
+  int sock;
+  
+  if(argc != 2)
+  error:
+    return(fprintf(stderr, "%s: %s\n", argv[0], errString), EXIT_FAILURE);
+
+  if((sock = getsock(argv[1], &errString)) == -1)
+    goto error;
+
+  printf("Socket fd:  %d\n", sock);
+
+  return(EXIT_SUCCESS)
+;
+}
+#endif
+#+end_src
+
+** ICMP echo request
+Craft an ICMP message and send it:
+
+#+begin_src C :noweb yes :tangle sendicmp.c
+<<receiveSocket>>
+
+static uint16_t checksum (uint16_t *addr, int len) {
+  int count = len;
+  register uint32_t sum = 0;
+  uint16_t answer = 0;
+
+  // Sum up 2-byte values until none or only one byte left.
+  while (count > 1) {
+    sum += *(addr++);
+    count -= 2;
+  }
+
+  // Add left-over byte, if any.
+  if (count > 0) {
+    sum += *(uint8_t *) addr;
+  }
+
+  // Fold 32-bit sum into 16 bits; we lose information by doing this,
+  // increasing the chances of a collision.
+  // sum = (lower 16 bits) + (upper 16 bits shifted right 16 bits)
+  while (sum >> 16) {
+    sum = (sum & 0xffff) + (sum >> 16);
+  }
+
+  // Checksum is one's compliment of sum.
+  answer = ~sum;
+
+  return (answer);
+}
+
+int main(int argc, char* argv[]) {
+  struct sockaddr_in addr = {0};
+  struct icmphdr icmp_hdr = {0};
+  char packetdata[sizeof(icmp_hdr) + 6] = {0};
+  int mysock;
+  char *errString = "";
+  int len = sizeof(icmp_hdr) + 5;
+
+  if(argc != 2)
+    return(fprintf(stderr, "%s hostname-or-ip\n", argv[0]), EXIT_FAILURE);
+
+  mysock  = getsock("hw", &errString);
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(0x7f000001); // XXX lookup address from argv[1]
+
+  icmp_hdr.type = ICMP_ECHO;
+  icmp_hdr.un.echo.id = htons(1234);
+  icmp_hdr.un.echo.sequence = htons(1);
+
+  memcpy(packetdata, &icmp_hdr, sizeof(icmp_hdr));
+  memcpy(packetdata + sizeof(icmp_hdr), "12345", 5); // 6 above for automatic zero pad
+  icmp_hdr.checksum = htons(checksum((uint16_t*)packetdata,
+                                     len + (len & 1)));
+  printf("sendto:  %d :: errno(%d)\n", sendto(mysock, packetdata, len, 0,
+                                              (struct sockaddr*)&addr,
+                                              sizeof(struct sockaddr_in)), errno);
+  char data[2222];
+  sleep(1); // XXX move to select
+  socklen_t l = sizeof(struct sockaddr_in);
+  printf("Recvfrom: %d\n", recvfrom(mysock, data, sizeof(data), MSG_DONTWAIT,
+                                    (struct sockaddr*)&addr, &l));
+  printf("Data: %s\n",data + sizoef(icmp_hdr));
+  (void)close(mysock);
+  return(EXIT_SUCCESS);    
+}
+#+end_src
